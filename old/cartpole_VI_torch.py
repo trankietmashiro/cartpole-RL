@@ -1,6 +1,5 @@
 import argparse
 from pathlib import Path
-from collections import Counter
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,7 +11,7 @@ from cartpole import dynamics, Discretizer, discrete_transition
 
 
 # ── Default checkpoint path ───────────────────────────────────────────────────
-DEFAULT_MODEL_PATH = "models/nn_pi_weights.pth"
+DEFAULT_MODEL_PATH = "models/nn_vi_weights.pth"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -53,7 +52,7 @@ def save_checkpoint(
 def load_checkpoint(
     model: NeuralNet,
     model_path: str = DEFAULT_MODEL_PATH,
-) -> NeuralNet | None:
+) -> "NeuralNet | None":
     """
     Load weights into *model* and return it.
     Returns None if the file is missing.
@@ -91,156 +90,10 @@ def states_to_tensor(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Policy stored as a plain dict  {state_tuple → action_float}
+# Main value-iteration loop
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_action(state: tuple, policy: dict) -> float:
-    return policy[state]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Policy evaluation  (TD(0) gradient-descent on V_θ)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def policy_evaluation(
-    V_net: NeuralNet,
-    optimizer: optim.Optimizer,
-    policy: dict,
-    disc: Discretizer,
-    states: list,
-    actions: list,
-    target_state: np.ndarray,
-    Q: np.ndarray,
-    R,
-    dt: float,
-    method: str,
-    gamma: float,
-    max_epochs: int = 100,
-    batch_size: int = 256,
-    theta: float = 1e-4,
-    device: torch.device = torch.device("cpu"),
-) -> NeuralNet:
-    """
-    Train V_net for the current policy using batched TD(0) regression.
-
-    For each (s, a=π(s)) pair we compute the TD target:
-        y = r(s,a) + γ · V_θ_old(s')
-    and minimise  ½ · (V_θ(s) − y)² with gradient descent.
-    """
-    loss_fn = nn.MSELoss()
-
-    s_list, s2_list, r_list = [], [], []
-    for s in states:
-        a     = get_action(s, policy)
-        s2, r = discrete_transition(dynamics, disc, s, a, target_state,
-                                    Q, R, dt, method=method)
-        s_list.append(s)
-        s2_list.append(s2)
-        r_list.append(float(r))
-
-    x_s  = states_to_tensor(s_list,  disc, device)
-    x_s2 = states_to_tensor(s2_list, disc, device)
-    r_t  = torch.tensor(r_list, dtype=torch.float32, device=device)
-
-    N       = len(states)
-    indices = torch.arange(N, device=device)
-
-    prev_loss = float("inf")
-    for epoch in range(max_epochs):
-        perm = indices[torch.randperm(N, device=device)]
-
-        epoch_loss = 0.0
-        n_batches  = 0
-
-        for start in range(0, N, batch_size):
-            idx  = perm[start : start + batch_size]
-            xs   = x_s[idx]
-            xs2  = x_s2[idx]
-            r_b  = r_t[idx]
-
-            with torch.no_grad():
-                td_target = r_b + gamma * V_net(xs2)
-
-            v_pred = V_net(xs)
-            loss   = loss_fn(v_pred, td_target)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            n_batches  += 1
-
-        avg_loss = epoch_loss / max(n_batches, 1)
-
-        if abs(prev_loss - avg_loss) < theta:
-            print(f"    eval converged at epoch {epoch+1}  loss={avg_loss:.6f}")
-            break
-        prev_loss = avg_loss
-
-    return V_net
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Policy improvement  (greedy w.r.t. V_net)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def policy_improvement(
-    V_net: NeuralNet,
-    policy: dict,
-    disc: Discretizer,
-    states: list,
-    actions: list,
-    target_state: np.ndarray,
-    Q: np.ndarray,
-    R,
-    dt: float,
-    method: str,
-    gamma: float,
-    device: torch.device = torch.device("cpu"),
-) -> tuple[dict, bool]:
-    """
-    For every state compute Q(s,a) = r(s,a) + γ·V(s') for each action,
-    then set π(s) = argmax_a Q(s,a).
-    """
-    stable = True
-
-    all_s2 = {}
-    all_r  = {}
-    for a in actions:
-        s2_list, r_list = [], []
-        for s in states:
-            s2, r = discrete_transition(dynamics, disc, s, a, target_state,
-                                        Q, R, dt, method=method)
-            s2_list.append(s2)
-            r_list.append(float(r))
-        x_s2 = states_to_tensor(s2_list, disc, device)
-        with torch.no_grad():
-            v_s2 = V_net(x_s2).cpu().numpy()
-        all_s2[a] = v_s2
-        all_r[a]  = np.array(r_list, dtype=np.float32)
-
-    for i, s in enumerate(states):
-        old_a  = get_action(s, policy)
-        best_a = old_a
-        best_q = -np.inf
-        for a in actions:
-            q = all_r[a][i] + gamma * all_s2[a][i]
-            if q > best_q:
-                best_q = q
-                best_a = a
-        policy[s] = best_a
-        if best_a != old_a:
-            stable = False
-
-    return policy, stable
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main policy-iteration loop
-# ──────────────────────────────────────────────────────────────────────────────
-
-def policy_iteration(
+def value_iteration(
     disc: Discretizer,
     states: list,
     actions: list,
@@ -252,43 +105,98 @@ def policy_iteration(
     gamma: float     = 0.99,
     lr: float        = 1e-3,
     hidden: int      = 64,
-    eval_epochs: int = 100,
-    eval_batch: int  = 256,
+    fit_epochs: int  = 100,
+    fit_batch: int   = 256,
     iterations: int  = 50,
-):
+    theta: float     = 1e-4,
+) -> NeuralNet:
+    """
+    Neural-network value iteration.
+
+    Each outer iteration:
+      1. Compute Bellman optimality targets using the *current* (frozen) V_net:
+             y(s) = max_a  [ r(s, a)  +  γ · V_θ_old(s') ]
+      2. Fit a *fresh* copy of V_net to those targets by minimising
+             ½ · (V_θ(s) − y(s))²   via Adam for `fit_epochs` epochs.
+      3. Check convergence:  max_s |y(s) − V_θ_old(s)| < theta → stop.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     V_net     = NeuralNet(input_dim=4, hidden=hidden).to(device)
     optimizer = optim.Adam(V_net.parameters(), lr=lr)
+    loss_fn   = nn.MSELoss()
 
-    pi = {s: actions[len(actions) // 2] for s in states}
+    # Pre-compute transitions for every (state, action) pair — these are fixed.
+    # s2_tensors[a_idx] : (N, D) tensor of next-state features
+    # r_tensors[a_idx]  : (N,)   tensor of rewards
+    print("Pre-computing transitions …")
+    N = len(states)
+    x_s = states_to_tensor(states, disc, device)           # (N, D)
 
-    for i in range(iterations):
-        print(f"\n=== PI iter {i} ===")
+    s2_tensors = []
+    r_tensors  = []
+    for a in actions:
+        s2_list, r_list = [], []
+        for s in states:
+            s2, r = discrete_transition(dynamics, disc, s, a, target,
+                                        Q, R, dt, method=method)
+            s2_list.append(s2)
+            r_list.append(float(r))
+        s2_tensors.append(states_to_tensor(s2_list, disc, device))
+        r_tensors.append(torch.tensor(r_list, dtype=torch.float32, device=device))
+    print("Transitions ready.")
 
-        V_net = policy_evaluation(
-            V_net, optimizer, pi, disc, states, actions, target,
-            Q, R, dt, method, gamma,
-            max_epochs=eval_epochs, batch_size=eval_batch,
-            device=device,
-        )
+    indices = torch.arange(N, device=device)
 
-        pi, stable = policy_improvement(
-            V_net, pi, disc, states, actions, target,
-            Q, R, dt, method, gamma, device=device,
-        )
+    for vi_iter in range(iterations):
+        print(f"\n=== VI iter {vi_iter} ===")
 
-        counts = Counter(pi.values())
-        N = len(pi)
-        print("Action distribution:")
-        for a in actions:
-            c = counts.get(a, 0)
-            print(f"  action {a:>5.1f}: {c:>6} states  ({100.0 * c / N:5.2f}%)")
+        # ── Step 1: compute Bellman optimality targets (frozen net) ──────
+        V_net.eval()
+        with torch.no_grad():
+            # Stack Q-values: (A, N)
+            q_values = torch.stack([
+                r_tensors[ai] + gamma * V_net(s2_tensors[ai])
+                for ai in range(len(actions))
+            ], dim=0)                                       # (A, N)
 
-        if stable:
-            print("Policy stable — done.")
+            targets, _ = q_values.max(dim=0)               # (N,)
+
+            # Convergence check against old value estimates
+            v_old  = V_net(x_s)                            # (N,)
+            delta  = (targets - v_old).abs().max().item()
+        print(f"  Bellman residual (max |y - V_old|) = {delta:.6f}")
+
+        if delta < theta:
+            print("Value function converged — done.")
             break
+
+        # ── Step 2: fit V_net to the new targets ─────────────────────────
+        V_net.train()
+        prev_loss = float("inf")
+        for epoch in range(fit_epochs):
+            perm = indices[torch.randperm(N, device=device)]
+
+            epoch_loss = 0.0
+            n_batches  = 0
+            for start in range(0, N, fit_batch):
+                idx    = perm[start : start + fit_batch]
+                v_pred = V_net(x_s[idx])
+                loss   = loss_fn(v_pred, targets[idx])
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                n_batches  += 1
+
+            avg_loss = epoch_loss / max(n_batches, 1)
+            if abs(prev_loss - avg_loss) < 1e-6:
+                print(f"    fit converged at epoch {epoch+1}  loss={avg_loss:.6f}")
+                break
+            prev_loss = avg_loss
 
     return V_net
 
@@ -417,7 +325,7 @@ def plot_policy_x_theta(
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CartPole policy iteration with save/load.")
+    parser = argparse.ArgumentParser(description="CartPole value iteration (neural net).")
     parser.add_argument(
         "--retrain", action="store_true",
         help="Force retraining even if a saved checkpoint already exists.",
@@ -434,7 +342,7 @@ if __name__ == "__main__":
         highs=[ 1.0,  1.0,  np.pi / 12,  1.0],
         n_bins=[11, 11, 11, 11],
     )
-    actions = np.linspace(-2.0, 2.0, 9).tolist()
+    actions = np.round(np.linspace(-2.0, 2.0, 9), 2).tolist()
     xd      = np.zeros(4)
     Q       = np.diag([5.0, 0.5, 5.0, 0.5])
     R       = 0.01
@@ -452,12 +360,13 @@ if __name__ == "__main__":
         else:
             print("[main] No checkpoint found — training from scratch.")
 
-        V_net = policy_iteration(
+        V_net = value_iteration(
             disc, states, actions, xd, Q, R,
             dt=0.1, method="rk4",
             gamma=0.99, lr=1e-3,
-            hidden=64, eval_epochs=150,
-            eval_batch=256, iterations=20,
+            hidden=64, fit_epochs=150,
+            fit_batch=256, iterations=50,
+            theta=1e-4,
         )
 
         save_checkpoint(V_net, args.model_path)
@@ -486,5 +395,5 @@ if __name__ == "__main__":
     plot_policy_x_theta(
         V_net, disc, actions, xd, Q, R,
         dt=0.1, method="rk4", gamma=0.99,
-        save_path="figures/pi_policy_x_theta.png",
+        save_path="figures/vi_policy_x_theta.png",
     )
