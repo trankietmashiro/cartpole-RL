@@ -1,6 +1,6 @@
 """
-pi_solver.py
-============
+approx_pi_solver.py
+===================
 Neural-network policy iteration.
 
 Each outer iteration:
@@ -26,12 +26,15 @@ class PolicyIterationSolver(DPSolver):
     The key difference from VI:
       - _compute_targets  evaluates only the *current* policy (one action per state)
       - _post_fit_hook    improves the policy greedily and checks for stability
+
+    Policy is stored as a dict keyed by integer state index (0 … N-1) since
+    states are now continuous samples rather than hashable grid tuples.
     """
 
     def _pre_solve_hook(self) -> None:
         """Initialise a uniform policy: every state maps to the middle action."""
-        mid_action   = self.actions[len(self.actions) // 2]
-        self.policy  = {s: mid_action for s in self.states}
+        mid_action  = self.actions[len(self.actions) // 2]
+        self.policy = {i: mid_action for i in range(len(self.states))}
         print(f"[PI] Policy initialised with action = {mid_action:.2f} for all states.")
 
     # ── Policy evaluation targets ─────────────────────────────────────────────
@@ -40,9 +43,9 @@ class PolicyIterationSolver(DPSolver):
         self, transitions: dict
     ) -> tuple[torch.Tensor, bool]:
         """
-        For each state s, look up the policy action π(s) and compute:
+        For each state index i, look up the policy action π(i) and compute:
 
-            y(s) = r(s, π(s)) + γ · V(s')
+            y(i) = r(s_i, π(i)) + γ · V(s'_i)
 
         Uses advanced tensor indexing to select the right action for each
         state in a single vectorised operation (no Python loop over states).
@@ -50,15 +53,15 @@ class PolicyIterationSolver(DPSolver):
         s2_tensors = transitions["s2_tensors"]   # list of (N, D), one per action
         r_tensors  = transitions["r_tensors"]    # list of (N,),   one per action
 
-        # Map each state to the index of its policy action
+        # Map each state index to the index of its policy action
         action_to_idx = {a: i for i, a in enumerate(self.actions)}
+        N      = len(self.states)
         pi_idx = torch.tensor(
-            [action_to_idx[self.policy[s]] for s in self.states],
+            [action_to_idx[self.policy[i]] for i in range(N)],
             dtype=torch.long, device=self.device,
         )  # (N,)
 
-        N          = len(self.states)
-        state_idx  = torch.arange(N, device=self.device)   # (N,)
+        state_idx = torch.arange(N, device=self.device)   # (N,)
 
         self.V_net.eval()
         with torch.no_grad():
@@ -70,8 +73,6 @@ class PolicyIterationSolver(DPSolver):
             r_all = torch.stack(r_tensors, dim=0)   # (A, N)
 
             # Advanced indexing: for state n pick row pi_idx[n]
-            # v_next_all[pi_idx, state_idx] gives (N,) with each element
-            # being V(s') under the current policy action for that state.
             v_next_pi = v_next_all[pi_idx, state_idx]   # (N,)
             r_pi      = r_all     [pi_idx, state_idx]   # (N,)
 
@@ -85,7 +86,7 @@ class PolicyIterationSolver(DPSolver):
     def _post_fit_hook(self, transitions: dict) -> bool:
         """
         Greedy policy improvement:
-            π(s) ← argmax_a [ r(s, a) + γ · V(s') ]
+            π(i) ← argmax_a [ r(s_i, a) + γ · V(s'_i) ]
 
         Returns True if the policy did not change (stable → converged).
         """
@@ -100,19 +101,19 @@ class PolicyIterationSolver(DPSolver):
                  for ai in range(len(self.actions))],
                 dim=0,
             )
-            best_idx = q_values.argmax(dim=0).cpu().numpy()   # (N,) action indices
+            best_idx = q_values.argmin(dim=0).cpu().numpy()   # (N,) action indices
 
         # Update policy and check stability
         stable = True
-        for i, s in enumerate(self.states):
+        N      = len(self.states)
+        for i in range(N):
             new_a = self.actions[best_idx[i]]
-            if new_a != self.policy[s]:
+            if new_a != self.policy[i]:
                 stable = False
-            self.policy[s] = new_a
+            self.policy[i] = new_a
 
         # Print action distribution for monitoring
         counts = Counter(self.policy.values())
-        N      = len(self.policy)
         print("  Action distribution after improvement:")
         for a in self.actions:
             c = counts.get(a, 0)

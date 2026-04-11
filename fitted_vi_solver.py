@@ -4,7 +4,7 @@ vi_solver.py
 Fitted value iteration.
 
 Each outer iteration:
-  targets(s) = max_a [ r(s, a)  +  γ · V_old(s') ]
+  targets(s) = min_a [ r(s, a)  +  γ · V_old(s') ]
 
 Convergence:
   max_s | targets(s) − V_old(s) | < theta
@@ -18,7 +18,7 @@ class ValueIterationSolver(DPSolver):
     """
     Subclass of DPSolver that implements the value-iteration target:
 
-        y(s) = max_a [ r(s, a) + γ · V(s') ]
+        y(s) = min_a [ r(s, a) + γ · V(s') ]
 
     Convergence is measured by the Bellman residual (the max absolute
     difference between the new targets and the current value estimates)
@@ -50,11 +50,12 @@ class ValueIterationSolver(DPSolver):
             )                                   # (A, N)
 
             # Bellman optimality targets: best Q over actions for each state
-            targets, _ = q_values.max(dim=0)   # (N,)
+            # Reward is a cost (always >= 0), so we MINIMISE not maximise
+            targets, _ = q_values.min(dim=0)   # (N,)
 
-            # Bellman residual: how much did V change?
+            # Bellman residual: max absolute change in value estimates
             v_old  = self.V_net(x_s)           # (N,)
-            delta = ((targets - v_old).abs() / (v_old.abs() + 1e-8)).max().item()
+            delta = (targets - v_old).abs().mean().item()
 
         print(f"  Bellman residual = {delta:.6f}  (threshold = {self.theta:.6f})")
         return targets, delta < self.theta

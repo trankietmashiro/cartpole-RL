@@ -84,12 +84,11 @@ def get_next_state_continuous(dyn, x, u, dt, method="rk4"):
 # =========================
 # Reward (continuous)
 # =========================
-def get_reward(x, u, xd, Q, R, disc=None, oob_penalty=-1e6):
+def get_cost(x, u, xd, Q, R, lows=None, highs=None, oob_penalty=1e6):
     """
-    Quadratic reward:
-      r = -[(x-xd)^T Q (x-xd) + u^T R u] + (oob_penalty if x is OOB)
+      r = [(x-xd)^T Q (x-xd) + u^T R u] + (oob_penalty if x is OOB)
     """
-    x = np.asarray(x, dtype=float)
+    x  = np.asarray(x, dtype=float)
     xd = np.asarray(xd, dtype=float)
 
     dx = x - xd
@@ -98,98 +97,51 @@ def get_reward(x, u, xd, Q, R, disc=None, oob_penalty=-1e6):
     Q = np.asarray(Q, dtype=float)
     u = float(u)
 
-    # allow scalar R
     if np.isscalar(R):
         u_cost = float(R) * (u ** 2)
     else:
         R = np.asarray(R, dtype=float)
         u_cost = float(np.array([u]) @ R @ np.array([u]))
 
-    cost = float(dx @ Q @ dx + u_cost)
-    r = -cost
+    r = float(dx @ Q @ dx + u_cost)
 
-    if disc is not None:
-        oob = np.any(x < disc.lows) or np.any(x > disc.highs)
-        if oob:
-            r += float(oob_penalty)  # oob_penalty is negative by default
+    if lows is not None and highs is not None:
+        if np.any(x < lows) or np.any(x > highs):
+            r += float(oob_penalty)
 
     return float(r)
 
-# =========================
-# State discretization
-# =========================
-class Discretizer:
-    """
-    Discretizes continuous state x into a tuple of bin indices s=(i,j,k,l),
-    and maps s back to a representative continuous state using bin centers.
-    """
-    def __init__(self, lows, highs, n_bins):
-        self.lows  = np.asarray(lows, dtype=float)
-        self.highs = np.asarray(highs, dtype=float)
-        self.n_bins = np.asarray(n_bins, dtype=int)
-
-        assert self.lows.shape == self.highs.shape == self.n_bins.shape
-        assert np.all(self.highs > self.lows)
-        assert np.all(self.n_bins >= 2)
-
-        # spacing between neighboring bin centers (uniform)
-        self.width = (self.highs - self.lows) / (self.n_bins - 1)
-
-    def grid_edges(self):
-        """
-        Continuous bounds implied by the discretization grid (bin edges),
-        assuming self.lows/self.highs are bin centers.
-        """
-        edge_lows  = self.lows  - 0.5 * self.width
-        edge_highs = self.highs + 0.5 * self.width
-        return edge_lows, edge_highs
-
-    def is_oob(self, x):
-        """True if x lies outside the grid edges."""
-        x = np.asarray(x, dtype=float).reshape(-1)
-        lo, hi = self.grid_edges()
-        return bool(np.any(x < lo) or np.any(x > hi))
-
-    def discretize(self, x):
-        """
-        x (continuous) -> s (tuple of bin indices)
-        """
-        x = np.asarray(x, dtype=float)
-        x = np.clip(x, self.lows, self.highs)
-        idx = np.rint((x - self.lows) / self.width).astype(int)
-        idx = np.clip(idx, 0, self.n_bins - 1)
-        return tuple(idx.tolist())
-
-    def bin_center(self, s):
-        """
-        s (tuple of bin indices) -> representative continuous state (bin center)
-        """
-        s = np.asarray(s, dtype=float)
-        return self.lows + s * self.width
-
 
 # =========================
-# Discrete MDP wrapper
+# Continuous transition (no Discretizer needed)
 # =========================
-def discrete_transition(dyn, disc, s, a, xd, Q, R, dt, oob_penalty=-1e6, method="rk4"):
+def continuous_transition(
+    dyn, x, a, xd, Q, R, dt,
+    lows=None, highs=None,
+    method="rk4",
+    oob_penalty=1e6,
+):
     """
-    s : discrete state (tuple of bin indices)
-    returns:
-      s_next : discrete next state (tuple of bin indices)
-      r      : reward (float)
+    Roll out one step from a continuous state x under action a.
+
+    Parameters
+    ----------
+    dyn   : dynamics function f(x, a) → x_dot
+    x     : current continuous state (np.ndarray)
+    a     : scalar action
+    xd    : target state
+    Q, R  : cost weights
+    dt    : time step
+    lows, highs : state-space bounds for OOB penalty (optional)
+    method      : integration method ('euler' or 'rk4')
+    oob_penalty : reward penalty added when x_next is out of bounds
+
+    Returns
+    -------
+    x_next : np.ndarray  – next continuous state
+    r      : float       – immediate reward
     """
-
-    # 1) representative continuous state for dynamics rollout
-    x_center = disc.bin_center(s)
-
-    # 2) propagate dynamics from representative state
-    x_next = get_next_state_continuous(dyn, x_center, a, dt, method=method)
-
-    # 3) next discrete state
-    s_next = disc.discretize(x_next)
-
-    # 4) reward: use OOB check from discretizer edges; evaluate quadratic at bin center (stable for tabular DP)
-    r = get_reward(x_next, a, xd, Q, R, disc=disc, oob_penalty=oob_penalty)
-
-    return s_next, float(r)
-
+    x_next = get_next_state_continuous(dyn, x, a, dt, method=method)
+    r = get_cost(x_next, a, xd, Q, R, lows=lows, highs=highs,
+                   oob_penalty=oob_penalty)
+    return x_next, r
