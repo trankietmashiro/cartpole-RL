@@ -238,6 +238,6 @@ def animate_cartpole(t, x, param):
         return cart, lwheel, rwheel, pole_line, bob, title
 
     anim = FuncAnimation(fig, update, frames=len(t),
-                         interval=50, blit=False, repeat=True)
+                         interval=60, blit=False, repeat=False)
     plt.show()
     return anim
