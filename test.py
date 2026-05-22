@@ -1,118 +1,228 @@
 """
-Smoke test / demo for the neural network module.
+Deep Q-Learning for Pendulum Swing-Up.
 
-Runs in two parts:
-  1. Gradient check on a small random net to confirm forward and
-     backward agree to ~1e-7 relative error.
-  2. Train a small MLP to fit y = sin(2π·x1) · cos(2π·x2) and report
-     loss curve plus a few sample predictions.
+Only the pendulum-specific pieces live here:
+  * dynamics + Euler integration
+  * quadratic cost around the upright equilibrium
+  * angle wrapping / velocity clipping
+  * visualization (live pendulum, cost-to-go heatmap, convergence trace,
+    final policy rollout overlay)
+
+The training pipeline itself is in DQN.py and is environment-agnostic --
+this file just wires the four required callables into DQN.train_dqn.
 """
 
 import numpy as np
-import neural_nets as nn
+import matplotlib.pyplot as plt
+
+import DQN
 
 
-def gradient_check_demo():
-    print("=" * 60)
-    print("1) Gradient check")
-    print("=" * 60)
-
-    # Small inputs keep the finite-difference loop fast.
-    np.random.seed(0)
-    x = np.random.randn(3, 8)   # input_dim=3, batch=8
-    y = np.random.randn(2, 8)   # output_dim=2
-
-    # Mix activation families so both He and Xavier paths are exercised.
-    layers  = ["tanh", "relu"]
-    weights = nn.init_NN([3, 6, 4, 2], layers=layers, seed=0)
-
-    errs = nn.gradient_check(x, y, weights, layers, eps=1e-6)
-
-    print("Max relative error per parameter (want < 1e-4):")
-    all_ok = True
-    for name, e in errs.items():
-        ok = e < 1e-4
-        all_ok &= ok
-        flag = "ok" if ok else "FAIL"
-        print(f"  {name:8s}  {e:.2e}  [{flag}]")
-    print(f"\n  Overall: {'PASS' if all_ok else 'FAIL'}\n")
+# ──────────────────────────────────────────────────────────────────────────────
+# Global timestep
+# ──────────────────────────────────────────────────────────────────────────────
+DT = 0.1
 
 
-def training_demo():
-    print("=" * 60)
-    print("2) Training: fit y = sin(2π·x1) · cos(2π·x2)")
-    print("=" * 60)
+# ==============================================================================
+# Pendulum dynamics
+# ==============================================================================
+def dynamics(x: np.ndarray, u) -> np.ndarray:
+    """
+    x : (2, N) – [theta; theta_dot]
+    u : scalar or (1, N)
+    Returns xdot (2, N).
+    """
+    m, l, b = 1.0, 0.5, 0.1
+    I, g    = 0.25, 9.8
+    return np.vstack([
+        x[1, :],
+        (u - m * g * l * np.sin(x[0, :]) - b * x[1, :]) / I,
+    ])
 
-    rng = np.random.default_rng(0)
-    N   = 1000
-    x   = rng.uniform(-1.0, 1.0, size=(2, N))
-    y   = (np.sin(2 * np.pi * x[0]) * np.cos(2 * np.pi * x[1]))[None, :]
-    y  += 0.05 * rng.standard_normal(y.shape)   # mild noise
 
-    layers  = ["relu", "relu"]
-    weights = nn.init_NN([2, 64, 64, 1], layers=layers, seed=0)
+# ==============================================================================
+# Instantaneous cost  g(x, u)
+# ==============================================================================
+def get_QR():
+    Q = np.diag([10.0, 1.0]) * DT
+    R = 1.0 * DT
+    return Q, R
 
-    # Baseline loss before any training.
-    y0, _, _ = nn.forward(x, weights, layers)
-    print(f"Initial loss: {nn.mse_loss(y0, y):.4f}\n")
 
-    weights, hist = nn.train(
-        x, y, weights, layers,
-        lr=1e-3, epochs=200, batch_size=64,
-        optimizer="adam", weight_decay=0.0,
-        log_every=20, seed=0,
+def cost_function(X: np.ndarray, u: np.ndarray, Xd: np.ndarray) -> np.ndarray:
+    """
+    Quadratic penalty around the upright. Matches the signature DQN.train_dqn
+    expects: vectorized over the batch dimension.
+        X  : (2, N)
+        u  : (1, N)
+        Xd : (2,)  desired state
+    Returns (N,).
+    """
+    Q, R = get_QR()
+    return (Q[0, 0] * (X[0, :] - Xd[0]) ** 2
+            + Q[1, 1] * (X[1, :] - Xd[1]) ** 2
+            + R * u.ravel() ** 2)
+
+
+# ==============================================================================
+# State normalisation / angle wrapping
+# ==============================================================================
+def normalize_state(s: np.ndarray, q_bins: np.ndarray,
+                    qdot_bins: np.ndarray) -> np.ndarray:
+    s = s.copy()
+    s[0, :] = np.mod(s[0, :], 2 * np.pi)
+    s[0, :] = np.clip(s[0, :], q_bins[0],    q_bins[-1])
+    s[1, :] = np.clip(s[1, :], qdot_bins[0], qdot_bins[-1])
+    return s
+
+
+# ==============================================================================
+# Visualisation helpers
+# ==============================================================================
+def vi_plot(J: np.ndarray, q_bins: np.ndarray, qdot_bins: np.ndarray,
+            ax: plt.Axes):
+    n1, n2 = len(q_bins), len(qdot_bins)
+    ax.cla()
+    ax.imshow(J.reshape(n1, n2).T,
+              origin='lower',
+              extent=[q_bins[0], q_bins[-1], qdot_bins[0], qdot_bins[-1]],
+              aspect='auto', cmap='viridis')
+    ax.set_xlabel('θ (rad)')
+    ax.set_ylabel('θ̇ (rad/s)')
+    ax.set_title('Cost-to-go')
+    plt.pause(0.01)
+
+
+def draw_pendulum(x: np.ndarray, ax: plt.Axes):
+    theta = x[0]
+    l = 0.75
+    ax.cla()
+    px = l * np.sin(theta)
+    py = -l * np.cos(theta)
+    ax.plot([0, px], [0, py], 'r-', linewidth=3)
+    ax.plot(px, py, 'ko', markersize=12)
+    ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
+    ax.set_aspect('equal')
+    ax.set_title(f'θ = {theta:.2f} rad')
+    plt.pause(0.001)
+
+
+# ==============================================================================
+# Main entry point
+# ==============================================================================
+def deep_qlearning():
+    np.random.seed(42)
+
+    # ── Problem setup ────────────────────────────────────────────────────────
+    xd      = np.array([np.pi, 0.0])           # desired state (upright)
+    actions = np.linspace(-2, 2, 11)           # discrete torques
+
+    # State-space grid (used for both normalization bounds and visualization)
+    q_bins    = np.linspace(0,   2 * np.pi, 51)
+    qdot_bins = np.linspace(-10, 10,        51)
+    qq, qqd   = np.meshgrid(q_bins, qdot_bins, indexing='ij')
+    s_grid    = np.vstack([qq.ravel(), qqd.ravel()])      # (2, 51*51)
+
+    # ── Step function expected by the trainer ────────────────────────────────
+    # Closes over q_bins / qdot_bins so termination and normalization stay in
+    # sync. The trainer calls this as step_fn(x_1d, u_scalar).
+    def step_fn(x: np.ndarray, u: float):
+        x1 = x.reshape(2, 1) + dynamics(x.reshape(2, 1), u) * DT
+        x1 = x1.ravel()
+        done = bool(x1[1] > qdot_bins[-1] or x1[1] < qdot_bins[0])
+        x1 = normalize_state(x1.reshape(2, 1), q_bins, qdot_bins).ravel()
+        return x1, done
+
+    # ── Live visualisation (pendulum | cost-to-go | convergence) ─────────────
+    plt.ion()
+    fig, (ax_pend, ax_ctg, ax_conv) = plt.subplots(1, 3, figsize=(15, 4))
+    fig.tight_layout()
+
+    # List-cell so the inner callback can rebind without needing `nonlocal`.
+    Jlast   = [np.zeros(s_grid.shape[1])]
+    dJnorm  = []
+    kJ_hist = []
+
+    def on_sync(Qt: DQN.QModel, k: int):
+        """Called by the trainer after every target-net hard sync."""
+        J = DQN.cost_to_go(Qt, s_grid)
+        dJnorm.append(np.linalg.norm(J - Jlast[0]))
+        kJ_hist.append(k)
+        Jlast[0] = J
+
+        vi_plot(J, q_bins, qdot_bins, ax_ctg)
+        ax_conv.cla()
+        ax_conv.plot(kJ_hist, dJnorm, 'b-')
+        ax_conv.set_xlabel('Simulation step')
+        ax_conv.set_ylabel('‖ΔJ‖')
+        ax_conv.set_title('Convergence')
+        plt.pause(0.01)
+
+    # ── Hyper-parameters & training ──────────────────────────────────────────
+    cfg = DQN.DQNConfig(
+        hidden                = 64,
+        activations           = ("relu", "relu"),
+        lr                    = 0.01,
+        batch_size            = 1024,
+        max_epochs            = 100,
+        gamma                 = 0.8,
+        alpha                 = 1.0,
+        eps_min               = 0.01,
+        eps_decay             = 0.01,
+        num_episodes          = 300,
+        max_steps_per_episode = 200,
+        warmup_steps          = 1000,
+        train_every           = 20,
+        target_sync_every     = 100,
+        sample_size           = 500,
+        seed                  = 42,
+        on_target_sync        = on_sync,
     )
 
-    print(f"\nLoss: {hist[0]:.4f}  →  {hist[-1]:.6f}")
-    print(f"Reduction factor: {hist[0] / max(hist[-1], 1e-12):.1f}x\n")
-
-    # Spot check on fresh (held-out) samples.
-    print("Sample predictions on fresh points:")
-    x_test = rng.uniform(-1.0, 1.0, size=(2, 5))
-    y_true = np.sin(2 * np.pi * x_test[0]) * np.cos(2 * np.pi * x_test[1])
-    y_pred, _, _ = nn.forward(x_test, weights, layers)
-
-    print(f"  {'x1':>7s} {'x2':>7s} {'true':>9s} {'pred':>9s} {'|err|':>9s}")
-    for i in range(x_test.shape[1]):
-        print(f"  {x_test[0, i]:7.3f} {x_test[1, i]:7.3f} "
-              f"{y_true[i]:9.4f} {y_pred[0, i]:9.4f} "
-              f"{abs(y_true[i] - y_pred[0, i]):9.4f}")
-
-
-def sgd_vs_adam_demo():
-    print("\n" + "=" * 60)
-    print("3) Sanity: Adam should beat plain SGD on the same problem")
-    print("=" * 60)
-
-    rng = np.random.default_rng(1)
-    N   = 500
-    x   = rng.uniform(-1.0, 1.0, size=(2, N))
-    y   = (np.sin(2 * np.pi * x[0]) * np.cos(2 * np.pi * x[1]))[None, :]
-
-    layers = ["relu", "relu"]
-
-    # Identical init for a fair comparison.
-    w_sgd  = nn.init_NN([2, 32, 32, 1], layers=layers, seed=42)
-    w_adam = nn.init_NN([2, 32, 32, 1], layers=layers, seed=42)
-
-    print("\n-- SGD (lr=0.05) --")
-    _, hist_sgd = nn.train(
-        x, y, w_sgd, layers,
-        lr=0.05, epochs=100, batch_size=64,
-        optimizer="sgd", log_every=25, seed=7,
+    Qm, Qt = DQN.train_dqn(
+        state_dim = 2,
+        actions   = actions,
+        target    = xd,
+        reset_fn  = lambda: np.array([0.0, 0.0]),
+        step_fn   = step_fn,
+        cost_fn   = cost_function,
+        cfg       = cfg,
     )
+    Qt.save("pendulum_qnet.npz")
+    print('Training complete.')
 
-    print("\n-- Adam (lr=1e-3) --")
-    _, hist_adam = nn.train(
-        x, y, w_adam, layers,
-        lr=1e-3, epochs=100, batch_size=64,
-        optimizer="adam", log_every=25, seed=7,
-    )
+    # ── Final cost-to-go ─────────────────────────────────────────────────────
+    J = DQN.cost_to_go(Qt, s_grid)
+    vi_plot(J, q_bins, qdot_bins, ax_ctg)
+    plt.ioff()
 
-    print(f"\nFinal loss  | SGD: {hist_sgd[-1]:.5f}   Adam: {hist_adam[-1]:.5f}")
+    # ── Roll out the learned policy ──────────────────────────────────────────
+    x0    = np.array([0.0, 0.0])
+    xsave = np.zeros((2, 100))
+    for k in range(100):
+        draw_pendulum(x0, ax_pend)
+        xsave[:, k] = x0
+        a_ind = DQN.epsilon_greedy(Qt, x0, epsilon=0.0, state_dim=2)
+        u     = float(actions[a_ind])
+        x1    = x0.reshape(2, 1) + dynamics(x0.reshape(2, 1), u) * DT
+        x0    = normalize_state(x1, q_bins, qdot_bins).ravel()
+
+    # Trajectory in state space, overlaid on cost-to-go
+    fig2, ax2 = plt.subplots(figsize=(6, 5))
+    ax2.imshow(J.reshape(len(q_bins), len(qdot_bins)).T,
+               origin='lower',
+               extent=[q_bins[0], q_bins[-1], qdot_bins[0], qdot_bins[-1]],
+               aspect='auto', cmap='viridis')
+    ax2.plot(xsave[0, :], xsave[1, :], '*-g', markersize=4,
+             label='Learned policy')
+    ax2.set_xlabel('θ (rad)'); ax2.set_ylabel('θ̇ (rad/s)')
+    ax2.set_title('Policy trajectory on cost-to-go')
+    ax2.legend()
+    plt.tight_layout()
+    plt.show()
 
 
-if __name__ == "__main__":
-    gradient_check_demo()
-    training_demo()
-    sgd_vs_adam_demo()
+# ==============================================================================
+if __name__ == '__main__':
+    deep_qlearning()
